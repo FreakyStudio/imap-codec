@@ -210,6 +210,27 @@ pub(crate) fn body_fields(input: &[u8]) -> IMAPResult<&[u8], BasicFields> {
     ))
 }
 
+/// Second half of a `body-fld-param` key/value pair.
+///
+/// RFC 3501 requires `string`; some servers send `NIL` for the value (see `quirk_body_fld_param_nil_value`).
+#[inline]
+fn body_fld_param_value(input: &[u8]) -> IMAPResult<&[u8], IString> {
+    #[cfg(not(feature = "quirk_body_fld_param_nil_value"))]
+    {
+        string(input)
+    }
+
+    #[cfg(feature = "quirk_body_fld_param_nil_value")]
+    {
+        alt((
+            string,
+            map(nil, |_| {
+                IString::try_from("").expect("empty string is valid IString")
+            }),
+        ))(input)
+    }
+}
+
 /// ```abnf
 /// body-fld-param = "("
 ///                    string SP string
@@ -223,7 +244,10 @@ pub(crate) fn body_fld_param(input: &[u8]) -> IMAPResult<&[u8], Vec<(IString, IS
             // Quirk: See https://github.com/emersion/go-imap/issues/557
             separated_list0(
                 sp,
-                map(tuple((string, sp, string)), |(key, _, value)| (key, value)),
+                map(
+                    tuple((string, sp, body_fld_param_value)),
+                    |(key, _, value)| (key, value),
+                ),
             ),
             tag(b")"),
         ),
@@ -769,6 +793,25 @@ mod tests {
         for test in tests {
             known_answer_test_encode(test);
         }
+    }
+
+    /// Nested `multipart/mixed` → `multipart/alternative` with `("boundary" NIL)` in extension data
+    /// (invalid per RFC 3501; reproduced via `cargo run --example=client`, see imap-codec#700).
+    #[test]
+    fn test_body_fld_param_nil_boundary_quirk() {
+        let wire = concat!(
+            "(((",
+            "\"text\" \"plain\" (\"charset\" \"utf-8\") NIL NIL \"base64\" 1628 0 NIL NIL NIL NIL)",
+            "(\"text\" \"html\" (\"charset\" \"utf-8\") NIL NIL \"quoted-printable\" 21021 0 NIL NIL NIL NIL) ",
+            "\"alternative\" (\"boundary\" NIL)) ",
+            "\"mixed\" (\"boundary\" NIL))"
+        );
+
+        #[cfg(not(feature = "quirk_body_fld_param_nil_value"))]
+        assert!(body(8)(wire.as_bytes()).is_err());
+
+        #[cfg(feature = "quirk_body_fld_param_nil_value")]
+        body(8)(wire.as_bytes()).expect("NIL param value should parse with quirk");
     }
 
     #[test]
